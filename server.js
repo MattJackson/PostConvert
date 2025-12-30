@@ -26,7 +26,8 @@ app.post("/convert", async (req, res) => {
 
     const jpeg = await sharp(input, { failOnError: false })
       .rotate() // respect EXIF orientation
-      .jpeg({ quality: 85 })
+      // "Best quality" JPEG: max quality + 4:4:4 chroma (less color smearing)
+      .jpeg({ quality: 100, chromaSubsampling: "4:4:4" })
       .toBuffer();
 
     res.setHeader("Content-Type", "image/jpeg");
