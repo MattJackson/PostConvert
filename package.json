@@ -4,6 +4,7 @@
   "private": true,
   "dependencies": {
     "express": "^4.19.2",
-    "sharp": "^0.33.5"
+    "sharp": "^0.33.5",
+    "archiver": "^6.0.2"
   }
 }
