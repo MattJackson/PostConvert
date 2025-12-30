@@ -32,17 +32,16 @@ app.post("/convert", async (req, res) => {
     const input = req.body;
     if (!input || input.length === 0) return res.status(400).send("Empty body");
 
-    const contentType = (req.headers["content-type"] || "").toLowerCase();
-    const filename = (req.headers["x-filename"] || "").toLowerCase();
+    const contentType = String(req.headers["content-type"] || "").toLowerCase();
+    const filename = String(req.headers["x-filename"] || "").toLowerCase();
     const isPdf = contentType === "application/pdf" || filename.endsWith(".pdf");
 
     let imageBuffer = input;
 
     if (isPdf) {
-      // PDF -> first page JPEG at 300 DPI
       const id = randomUUID();
       const pdfPath = `/tmp/${id}.pdf`;
-      const outPrefix = `/tmp/${id}`; // output will be `${outPrefix}.jpg`
+      const outPrefix = `/tmp/${id}`;
 
       await fs.writeFile(pdfPath, input);
 
@@ -79,27 +78,28 @@ app.post("/convert/pdf", async (req, res) => {
     const input = req.body;
     if (!input || input.length === 0) return res.status(400).send("Empty body");
 
-    const contentType = (req.headers["content-type"] || "").toLowerCase();
-    const filename = (req.headers["x-filename"] || "").toLowerCase();
+    const contentType = String(req.headers["content-type"] || "").toLowerCase();
+    const filename = String(req.headers["x-filename"] || "").toLowerCase();
     const isPdf = contentType === "application/pdf" || filename.endsWith(".pdf");
 
     if (!isPdf) {
-      return res.status(415).send("This endpoint only accepts PDFs (Content-Type: application/pdf)");
+      return res
+        .status(415)
+        .send("This endpoint only accepts PDFs (Content-Type: application/pdf)");
     }
 
-    // Safety limits (tweak as you like)
+    // Safety limits
     const dpi = clampInt(req.headers["x-pdf-dpi"], 72, 600, 300);
     const maxPages = clampInt(req.headers["x-pdf-max-pages"], 1, 50, 20);
 
     const id = randomUUID();
     const pdfPath = `/tmp/${id}.pdf`;
     const outDir = `/tmp/${id}-pages`;
-    const outPrefix = path.join(outDir, "page"); // produces page-1.jpg, page-2.jpg, ...
+    const outPrefix = path.join(outDir, "page"); // page-1.jpg, page-2.jpg ...
 
     await fs.mkdir(outDir, { recursive: true });
     await fs.writeFile(pdfPath, input);
 
-    // Render all pages to JPEG files
     await execFilePromise("pdftoppm", [
       "-jpeg",
       "-r",
@@ -108,7 +108,6 @@ app.post("/convert/pdf", async (req, res) => {
       outPrefix,
     ]);
 
-    // Collect rendered pages
     const files = (await fs.readdir(outDir))
       .filter((f) => /^page-\d+\.jpg$/i.test(f))
       .sort((a, b) => pageNum(a) - pageNum(b));
@@ -122,7 +121,6 @@ app.post("/convert/pdf", async (req, res) => {
         .send(`PDF has ${files.length} pages; exceeds maxPages=${maxPages}`);
     }
 
-    // Stream a ZIP back
     res.status(200);
     res.setHeader("Content-Type", "application/zip");
     res.setHeader(
@@ -139,11 +137,12 @@ app.post("/convert/pdf", async (req, res) => {
 
     archive.pipe(res);
 
-    // Add each page file to the zip as 001.jpg, 002.jpg, ...
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
       const n = String(i + 1).padStart(3, "0");
-      archive.append(createReadStream(path.join(outDir, f)), { name: `${n}.jpg` });
+      archive.append(createReadStream(path.join(outDir, f)), {
+        name: `${n}.jpg`,
+      });
     }
 
     await archive.finalize();
@@ -161,4 +160,26 @@ app.use((err, _req, res, next) => {
   return next(err);
 });
 
+// ✅ MISSING PART: start the server + helpers
 const port = Number(process.env.PORT) || 8080;
+
+app.listen(port, "0.0.0.0", () => {
+  console.log(`converter listening on 0.0.0.0:${port}`);
+});
+
+function execFilePromise(cmd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, (err) => (err ? reject(err) : resolve()));
+  });
+}
+
+function pageNum(filename) {
+  const m = filename.match(/page-(\d+)\.jpg/i);
+  return m ? Number(m[1]) : 0;
+}
+
+function clampInt(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
