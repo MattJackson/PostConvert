@@ -1,5 +1,7 @@
 app = "postconvert"
 
+primary_region = "sjc"
+
 [build]
   dockerfile = "Dockerfile"
 
@@ -9,3 +11,6 @@ app = "postconvert"
   auto_start_machines = true
   auto_stop_machines = true
   min_machines_running = 0
+  max_machines_running = 1
+  concurrency = { soft_limit = 1, hard_limit = 2 }
+  grace_period = "30s"
