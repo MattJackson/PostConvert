@@ -45,7 +45,7 @@ async function toJpegWithSharp(inputBuffer) {
 
 async function toJpegWithFfmpeg(inputBuffer) {
   const id = randomUUID();
-  const inPath = `/tmp/${id}.bin`; // ffmpeg probes container; extension not required
+  const inPath = `/tmp/${id}.bin`; // ffmpeg probes; extension not required
   const outPath = `/tmp/${id}.jpg`;
 
   await fs.writeFile(inPath, inputBuffer);
@@ -59,36 +59,35 @@ async function toJpegWithFfmpeg(inputBuffer) {
     "-frames:v",
     "1",
     "-q:v",
-    "1", // high quality JPEG
+    "1", // high-quality JPEG from ffmpeg
     outPath,
   ]);
 
   const jpg = await fs.readFile(outPath);
 
-  // Normalize via sharp so output settings are consistent (quality 100, 4:4:4)
+  // Normalize output with sharp to enforce consistent settings (quality 100, 4:4:4)
   return toJpegWithSharp(jpg);
 }
 
-async function toJpegWithMagick(inputBuffer) {
+async function toJpegWithImagemagick(inputBuffer) {
   const id = randomUUID();
   const inPath = `/tmp/${id}.bin`;
   const outPath = `/tmp/${id}.jpg`;
 
   await fs.writeFile(inPath, inputBuffer);
 
-  // ImageMagick: convert whatever it can to JPEG
-  // -strip removes metadata; remove if you want to preserve EXIF
-  await execFilePromise("magick", [
-    inPath,
-    "-auto-orient",
-    "-quality",
-    "100",
-    outPath,
-  ]);
+  // ImageMagick 7 uses `magick`; IM6 uses `convert`
+  // We'll try `magick` first, then fallback to `convert`.
+  const args = [inPath, "-auto-orient", "-quality", "100", outPath];
+
+  try {
+    await execFilePromise("magick", args);
+  } catch (e) {
+    // If magick isn't installed, IM6 usually provides `convert`
+    await execFilePromise("convert", args);
+  }
 
   const jpg = await fs.readFile(outPath);
-
-  // Normalize via sharp for consistent chromaSubsampling etc.
   return toJpegWithSharp(jpg);
 }
 
@@ -122,14 +121,14 @@ app.post("/convert", async (req, res) => {
     const input = req.body;
     if (!input || input.length === 0) return res.status(400).send("Empty body");
 
-    // PDF: always handle via poppler (pdftoppm)
+    // PDF: always handle via poppler
     if (isPdfRequest(req)) {
       const jpeg = await pdfFirstPageToJpeg(input, 300);
       res.setHeader("Content-Type", "image/jpeg");
       return res.status(200).send(jpeg);
     }
 
-    // Non-PDF: sharp -> ffmpeg -> magick
+    // Non-PDF: sharp -> ffmpeg -> imagemagick
     try {
       const jpeg = await toJpegWithSharp(input);
       res.setHeader("Content-Type", "image/jpeg");
@@ -140,7 +139,7 @@ app.post("/convert", async (req, res) => {
         res.setHeader("Content-Type", "image/jpeg");
         return res.status(200).send(jpeg);
       } catch (e2) {
-        const jpeg = await toJpegWithMagick(input);
+        const jpeg = await toJpegWithImagemagick(input);
         res.setHeader("Content-Type", "image/jpeg");
         return res.status(200).send(jpeg);
       }
@@ -177,7 +176,13 @@ app.post("/convert/pdf", async (req, res) => {
     await fs.mkdir(outDir, { recursive: true });
     await fs.writeFile(pdfPath, input);
 
-    await execFilePromise("pdftoppm", ["-jpeg", "-r", String(dpi), pdfPath, outPrefix]);
+    await execFilePromise("pdftoppm", [
+      "-jpeg",
+      "-r",
+      String(dpi),
+      pdfPath,
+      outPrefix,
+    ]);
 
     const files = (await fs.readdir(outDir))
       .filter((f) => /^page-\d+\.jpg$/i.test(f))
@@ -185,12 +190,17 @@ app.post("/convert/pdf", async (req, res) => {
 
     if (files.length === 0) return res.status(500).send("PDF render produced no pages");
     if (files.length > maxPages) {
-      return res.status(413).send(`PDF has ${files.length} pages; exceeds maxPages=${maxPages}`);
+      return res
+        .status(413)
+        .send(`PDF has ${files.length} pages; exceeds maxPages=${maxPages}`);
     }
 
     res.status(200);
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", `attachment; filename="pdf-pages-${id}.zip"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="pdf-pages-${id}.zip"`
+    );
 
     const archive = archiver("zip", { zlib: { level: 6 } });
     archive.on("error", (err) => {
