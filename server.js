@@ -24,40 +24,32 @@ function requireAuth(req, res) {
   return true;
 }
 
-function isHeicRequest(req) {
-  const contentType = String(req.headers["content-type"] || "").toLowerCase();
-  const filename = String(req.headers["x-filename"] || "").toLowerCase();
-  return (
-    contentType.includes("heic") ||
-    contentType.includes("heif") ||
-    filename.endsWith(".heic") ||
-    filename.endsWith(".heif")
-  );
-}
-
 function isPdfRequest(req) {
   const contentType = String(req.headers["content-type"] || "").toLowerCase();
   const filename = String(req.headers["x-filename"] || "").toLowerCase();
   return contentType === "application/pdf" || filename.endsWith(".pdf");
 }
 
-function isLibheifNoDecoderError(err) {
-  const msg = String(err?.stack || err || "");
-  return (
-    msg.includes("No decoding plugin installed") ||
-    msg.includes("Error while loading plugin") ||
-    msg.includes("compression format")
-  );
+// ---------- Core converters ----------
+
+async function toJpegWithSharp(inputBuffer) {
+  return sharp(inputBuffer, {
+    failOnError: false,
+    // Safety: avoid decompression bombs
+    limitInputPixels: 200e6,
+  })
+    .rotate()
+    .jpeg({ quality: 100, chromaSubsampling: "4:4:4" })
+    .toBuffer();
 }
 
-async function heicToJpegWithFfmpeg(inputBuffer) {
+async function toJpegWithFfmpeg(inputBuffer) {
   const id = randomUUID();
-  const inPath = `/tmp/${id}.heic`;
+  const inPath = `/tmp/${id}.bin`; // ffmpeg probes container; extension not required
   const outPath = `/tmp/${id}.jpg`;
 
   await fs.writeFile(inPath, inputBuffer);
 
-  // -y overwrite, -v error quiet output, scale/orient handled by sharp later if needed
   await execFilePromise("ffmpeg", [
     "-y",
     "-v",
@@ -66,13 +58,63 @@ async function heicToJpegWithFfmpeg(inputBuffer) {
     inPath,
     "-frames:v",
     "1",
+    "-q:v",
+    "1", // high quality JPEG
     outPath,
   ]);
 
-  return fs.readFile(outPath);
+  const jpg = await fs.readFile(outPath);
+
+  // Normalize via sharp so output settings are consistent (quality 100, 4:4:4)
+  return toJpegWithSharp(jpg);
 }
 
-// --- Endpoint 1: images (and PDF first page) -> single JPEG ---
+async function toJpegWithMagick(inputBuffer) {
+  const id = randomUUID();
+  const inPath = `/tmp/${id}.bin`;
+  const outPath = `/tmp/${id}.jpg`;
+
+  await fs.writeFile(inPath, inputBuffer);
+
+  // ImageMagick: convert whatever it can to JPEG
+  // -strip removes metadata; remove if you want to preserve EXIF
+  await execFilePromise("magick", [
+    inPath,
+    "-auto-orient",
+    "-quality",
+    "100",
+    outPath,
+  ]);
+
+  const jpg = await fs.readFile(outPath);
+
+  // Normalize via sharp for consistent chromaSubsampling etc.
+  return toJpegWithSharp(jpg);
+}
+
+async function pdfFirstPageToJpeg(inputBuffer, dpi = 300) {
+  const id = randomUUID();
+  const pdfPath = `/tmp/${id}.pdf`;
+  const outPrefix = `/tmp/${id}`;
+
+  await fs.writeFile(pdfPath, inputBuffer);
+
+  await execFilePromise("pdftoppm", [
+    "-jpeg",
+    "-r",
+    String(dpi),
+    "-singlefile",
+    pdfPath,
+    outPrefix,
+  ]);
+
+  const pageJpg = await fs.readFile(`${outPrefix}.jpg`);
+  return toJpegWithSharp(pageJpg);
+}
+
+// ---------- Endpoints ----------
+
+// Single JPEG output (images + PDF first page)
 app.post("/convert", async (req, res) => {
   try {
     if (!requireAuth(req, res)) return;
@@ -80,59 +122,36 @@ app.post("/convert", async (req, res) => {
     const input = req.body;
     if (!input || input.length === 0) return res.status(400).send("Empty body");
 
-    const isPdf = isPdfRequest(req);
-    const isHeic = isHeicRequest(req);
-
-    let imageBuffer = input;
-
-    // PDF -> first page JPEG at 300 DPI
-    if (isPdf) {
-      const id = randomUUID();
-      const pdfPath = `/tmp/${id}.pdf`;
-      const outPrefix = `/tmp/${id}`;
-
-      await fs.writeFile(pdfPath, input);
-
-      await execFilePromise("pdftoppm", [
-        "-jpeg",
-        "-r",
-        "300",
-        "-singlefile",
-        pdfPath,
-        outPrefix,
-      ]);
-
-      imageBuffer = await fs.readFile(`${outPrefix}.jpg`);
+    // PDF: always handle via poppler (pdftoppm)
+    if (isPdfRequest(req)) {
+      const jpeg = await pdfFirstPageToJpeg(input, 300);
+      res.setHeader("Content-Type", "image/jpeg");
+      return res.status(200).send(jpeg);
     }
 
-    // Try sharp first. If HEIC decode plugin missing, fallback to ffmpeg.
-    let jpeg;
+    // Non-PDF: sharp -> ffmpeg -> magick
     try {
-      jpeg = await sharp(imageBuffer, { failOnError: false })
-        .rotate()
-        .jpeg({ quality: 100, chromaSubsampling: "4:4:4" })
-        .toBuffer();
-    } catch (e) {
-      if (isHeic && isLibheifNoDecoderError(e)) {
-        const ffmpegJpeg = await heicToJpegWithFfmpeg(imageBuffer);
-        jpeg = await sharp(ffmpegJpeg, { failOnError: false })
-          .rotate()
-          .jpeg({ quality: 100, chromaSubsampling: "4:4:4" })
-          .toBuffer();
-      } else {
-        throw e;
+      const jpeg = await toJpegWithSharp(input);
+      res.setHeader("Content-Type", "image/jpeg");
+      return res.status(200).send(jpeg);
+    } catch (e1) {
+      try {
+        const jpeg = await toJpegWithFfmpeg(input);
+        res.setHeader("Content-Type", "image/jpeg");
+        return res.status(200).send(jpeg);
+      } catch (e2) {
+        const jpeg = await toJpegWithMagick(input);
+        res.setHeader("Content-Type", "image/jpeg");
+        return res.status(200).send(jpeg);
       }
     }
-
-    res.setHeader("Content-Type", "image/jpeg");
-    return res.status(200).send(jpeg);
   } catch (e) {
     console.error(e);
     return res.status(500).send(String(e?.stack || e));
   }
 });
 
-// --- Endpoint 2: PDF all pages -> ZIP of JPEG pages ---
+// PDF all pages -> ZIP of JPEG pages
 app.post("/convert/pdf", async (req, res) => {
   try {
     if (!requireAuth(req, res)) return;
@@ -148,12 +167,12 @@ app.post("/convert/pdf", async (req, res) => {
 
     // Safety limits
     const dpi = clampInt(req.headers["x-pdf-dpi"], 72, 600, 300);
-    const maxPages = clampInt(req.headers["x-pdf-max-pages"], 1, 50, 20);
+    const maxPages = clampInt(req.headers["x-pdf-max-pages"], 1, 200, 50);
 
     const id = randomUUID();
     const pdfPath = `/tmp/${id}.pdf`;
     const outDir = `/tmp/${id}-pages`;
-    const outPrefix = path.join(outDir, "page"); // page-1.jpg, page-2.jpg ...
+    const outPrefix = path.join(outDir, "page");
 
     await fs.mkdir(outDir, { recursive: true });
     await fs.writeFile(pdfPath, input);
@@ -204,14 +223,17 @@ app.use((err, _req, res, next) => {
 });
 
 const port = Number(process.env.PORT) || 8080;
-
 app.listen(port, "0.0.0.0", () => {
   console.log(`converter listening on 0.0.0.0:${port}`);
 });
 
+// ---------- Helpers ----------
 function execFilePromise(cmd, args) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, (err) => (err ? reject(err) : resolve()));
+    execFile(cmd, args, (err, _stdout, stderr) => {
+      if (err) reject(new Error(stderr || String(err)));
+      else resolve();
+    });
   });
 }
 
