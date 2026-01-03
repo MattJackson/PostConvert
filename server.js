@@ -6,7 +6,10 @@ import { createReadStream } from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 import archiver from "archiver";
-import libheif from "libheif-js";
+
+// libheif-js import can be default or module object depending on bundling
+import libheifModule from "libheif-js";
+const libheif = libheifModule?.default ?? libheifModule;
 
 const app = express();
 app.use(express.raw({ type: "*/*", limit: "30mb" }));
@@ -31,7 +34,7 @@ function isPdfRequest(req) {
 }
 
 function looksLikeHeic(buf) {
-  // ISO-BMFF "ftyp" at offset 4 is typical for HEIC/HEIF
+  // ISO-BMFF container: "ftyp" at offset 4, brand includes heic/heif/mif1/msf1
   if (!buf || buf.length < 32) return false;
   if (buf.toString("ascii", 4, 8) !== "ftyp") return false;
   const brands = buf.toString("ascii", 8, 32);
@@ -46,14 +49,20 @@ function looksLikeHeic(buf) {
 // ---------- Core converters ----------
 
 async function toJpegWithSharp(inputBuffer) {
-  return sharp(inputBuffer, { failOnError: false, limitInputPixels: 200e6 })
+  return sharp(inputBuffer, {
+    failOnError: false,
+    limitInputPixels: 200e6, // safety
+  })
     .rotate()
     .jpeg({ quality: 100, chromaSubsampling: "4:4:4" })
     .toBuffer();
 }
 
 async function heicToJpegWithWasm(inputBuffer) {
-  // Decode HEIC/HEIF to raw RGBA using libheif-js (WASM)
+  if (!libheif?.HeifDecoder) {
+    throw new Error("libheif-js not available (HeifDecoder missing)");
+  }
+
   const decoder = new libheif.HeifDecoder();
   const images = decoder.decode(inputBuffer);
 
@@ -62,15 +71,26 @@ async function heicToJpegWithWasm(inputBuffer) {
   }
 
   const img = images[0];
-
-  // libheif-js exposes width/height; decode to RGBA
   const width = img.get_width();
   const height = img.get_height();
 
-  const rgba = img.display({ data: null, width, height, channels: 4 });
+  // Allocate RGBA output buffer and ask libheif-js to fill it
+  const rgba = new Uint8Array(width * height * 4);
 
-  // Encode to JPEG with sharp (consistent settings)
-  return sharp(Buffer.from(rgba.data), { raw: { width, height, channels: 4 } })
+  // Different libheif-js versions behave slightly differently:
+  // - some fill the provided `data` buffer and return undefined
+  // - some return an object with { data: <typed array> }
+  const result = img.display({ data: rgba, width, height, channels: 4 });
+
+  const pixelData =
+    result?.data instanceof Uint8Array
+      ? result.data
+      : result?.data
+        ? new Uint8Array(result.data)
+        : rgba;
+
+  // Encode to JPEG with sharp (consistent output settings)
+  return sharp(Buffer.from(pixelData), { raw: { width, height, channels: 4 } })
     .jpeg({ quality: 100, chromaSubsampling: "4:4:4" })
     .toBuffer();
 }
@@ -97,6 +117,7 @@ async function pdfFirstPageToJpeg(inputBuffer, dpi = 300) {
 
 // ---------- Endpoints ----------
 
+// Single JPEG output (images + PDF first page)
 app.post("/convert", async (req, res) => {
   try {
     if (!requireAuth(req, res)) return;
@@ -111,19 +132,20 @@ app.post("/convert", async (req, res) => {
       return res.status(200).send(jpeg);
     }
 
-    // Try sharp first
+    // Try sharp first (fast path)
     try {
       const jpeg = await toJpegWithSharp(input);
       res.setHeader("Content-Type", "image/jpeg");
       return res.status(200).send(jpeg);
     } catch (sharpErr) {
-      // If it looks like HEIC/HEIF, use WASM decoder (bulletproof)
+      // If it looks like HEIC/HEIF, decode via WASM and encode to JPEG
       if (looksLikeHeic(input)) {
         const jpeg = await heicToJpegWithWasm(input);
         res.setHeader("Content-Type", "image/jpeg");
         return res.status(200).send(jpeg);
       }
-      // Otherwise bubble up (or add more fallbacks later if desired)
+
+      // Otherwise: return the original sharp error
       throw sharpErr;
     }
   } catch (e) {
