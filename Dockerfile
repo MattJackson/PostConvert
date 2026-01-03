@@ -3,9 +3,9 @@ FROM node:20-bookworm-slim
 RUN apt-get update && apt-get install -y \
   libheif1 libheif-dev \
   libvips libvips-dev \
-  libde265-0 \
   ffmpeg \
   poppler-utils \
+  imagemagick \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
