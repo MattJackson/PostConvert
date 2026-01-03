@@ -24,6 +24,54 @@ function requireAuth(req, res) {
   return true;
 }
 
+function isHeicRequest(req) {
+  const contentType = String(req.headers["content-type"] || "").toLowerCase();
+  const filename = String(req.headers["x-filename"] || "").toLowerCase();
+  return (
+    contentType.includes("heic") ||
+    contentType.includes("heif") ||
+    filename.endsWith(".heic") ||
+    filename.endsWith(".heif")
+  );
+}
+
+function isPdfRequest(req) {
+  const contentType = String(req.headers["content-type"] || "").toLowerCase();
+  const filename = String(req.headers["x-filename"] || "").toLowerCase();
+  return contentType === "application/pdf" || filename.endsWith(".pdf");
+}
+
+function isLibheifNoDecoderError(err) {
+  const msg = String(err?.stack || err || "");
+  return (
+    msg.includes("No decoding plugin installed") ||
+    msg.includes("Error while loading plugin") ||
+    msg.includes("compression format")
+  );
+}
+
+async function heicToJpegWithFfmpeg(inputBuffer) {
+  const id = randomUUID();
+  const inPath = `/tmp/${id}.heic`;
+  const outPath = `/tmp/${id}.jpg`;
+
+  await fs.writeFile(inPath, inputBuffer);
+
+  // -y overwrite, -v error quiet output, scale/orient handled by sharp later if needed
+  await execFilePromise("ffmpeg", [
+    "-y",
+    "-v",
+    "error",
+    "-i",
+    inPath,
+    "-frames:v",
+    "1",
+    outPath,
+  ]);
+
+  return fs.readFile(outPath);
+}
+
 // --- Endpoint 1: images (and PDF first page) -> single JPEG ---
 app.post("/convert", async (req, res) => {
   try {
@@ -32,12 +80,12 @@ app.post("/convert", async (req, res) => {
     const input = req.body;
     if (!input || input.length === 0) return res.status(400).send("Empty body");
 
-    const contentType = String(req.headers["content-type"] || "").toLowerCase();
-    const filename = String(req.headers["x-filename"] || "").toLowerCase();
-    const isPdf = contentType === "application/pdf" || filename.endsWith(".pdf");
+    const isPdf = isPdfRequest(req);
+    const isHeic = isHeicRequest(req);
 
     let imageBuffer = input;
 
+    // PDF -> first page JPEG at 300 DPI
     if (isPdf) {
       const id = randomUUID();
       const pdfPath = `/tmp/${id}.pdf`;
@@ -57,10 +105,24 @@ app.post("/convert", async (req, res) => {
       imageBuffer = await fs.readFile(`${outPrefix}.jpg`);
     }
 
-    const jpeg = await sharp(imageBuffer, { failOnError: false })
-      .rotate()
-      .jpeg({ quality: 100, chromaSubsampling: "4:4:4" })
-      .toBuffer();
+    // Try sharp first. If HEIC decode plugin missing, fallback to ffmpeg.
+    let jpeg;
+    try {
+      jpeg = await sharp(imageBuffer, { failOnError: false })
+        .rotate()
+        .jpeg({ quality: 100, chromaSubsampling: "4:4:4" })
+        .toBuffer();
+    } catch (e) {
+      if (isHeic && isLibheifNoDecoderError(e)) {
+        const ffmpegJpeg = await heicToJpegWithFfmpeg(imageBuffer);
+        jpeg = await sharp(ffmpegJpeg, { failOnError: false })
+          .rotate()
+          .jpeg({ quality: 100, chromaSubsampling: "4:4:4" })
+          .toBuffer();
+      } else {
+        throw e;
+      }
+    }
 
     res.setHeader("Content-Type", "image/jpeg");
     return res.status(200).send(jpeg);
@@ -78,11 +140,7 @@ app.post("/convert/pdf", async (req, res) => {
     const input = req.body;
     if (!input || input.length === 0) return res.status(400).send("Empty body");
 
-    const contentType = String(req.headers["content-type"] || "").toLowerCase();
-    const filename = String(req.headers["x-filename"] || "").toLowerCase();
-    const isPdf = contentType === "application/pdf" || filename.endsWith(".pdf");
-
-    if (!isPdf) {
+    if (!isPdfRequest(req)) {
       return res
         .status(415)
         .send("This endpoint only accepts PDFs (Content-Type: application/pdf)");
@@ -100,33 +158,20 @@ app.post("/convert/pdf", async (req, res) => {
     await fs.mkdir(outDir, { recursive: true });
     await fs.writeFile(pdfPath, input);
 
-    await execFilePromise("pdftoppm", [
-      "-jpeg",
-      "-r",
-      String(dpi),
-      pdfPath,
-      outPrefix,
-    ]);
+    await execFilePromise("pdftoppm", ["-jpeg", "-r", String(dpi), pdfPath, outPrefix]);
 
     const files = (await fs.readdir(outDir))
       .filter((f) => /^page-\d+\.jpg$/i.test(f))
       .sort((a, b) => pageNum(a) - pageNum(b));
 
-    if (files.length === 0) {
-      return res.status(500).send("PDF render produced no pages");
-    }
+    if (files.length === 0) return res.status(500).send("PDF render produced no pages");
     if (files.length > maxPages) {
-      return res
-        .status(413)
-        .send(`PDF has ${files.length} pages; exceeds maxPages=${maxPages}`);
+      return res.status(413).send(`PDF has ${files.length} pages; exceeds maxPages=${maxPages}`);
     }
 
     res.status(200);
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="pdf-pages-${id}.zip"`
-    );
+    res.setHeader("Content-Disposition", `attachment; filename="pdf-pages-${id}.zip"`);
 
     const archive = archiver("zip", { zlib: { level: 6 } });
     archive.on("error", (err) => {
@@ -140,9 +185,7 @@ app.post("/convert/pdf", async (req, res) => {
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
       const n = String(i + 1).padStart(3, "0");
-      archive.append(createReadStream(path.join(outDir, f)), {
-        name: `${n}.jpg`,
-      });
+      archive.append(createReadStream(path.join(outDir, f)), { name: `${n}.jpg` });
     }
 
     await archive.finalize();
@@ -160,7 +203,6 @@ app.use((err, _req, res, next) => {
   return next(err);
 });
 
-// ✅ MISSING PART: start the server + helpers
 const port = Number(process.env.PORT) || 8080;
 
 app.listen(port, "0.0.0.0", () => {
