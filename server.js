@@ -6,9 +6,9 @@ import { createReadStream } from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 import archiver from "archiver";
+import libheif from "libheif-js";
 
 const app = express();
-
 app.use(express.raw({ type: "*/*", limit: "30mb" }));
 
 app.get("/", (_req, res) => res.status(200).send("postconvert: ok"));
@@ -30,65 +30,49 @@ function isPdfRequest(req) {
   return contentType === "application/pdf" || filename.endsWith(".pdf");
 }
 
+function looksLikeHeic(buf) {
+  // ISO-BMFF "ftyp" at offset 4 is typical for HEIC/HEIF
+  if (!buf || buf.length < 32) return false;
+  if (buf.toString("ascii", 4, 8) !== "ftyp") return false;
+  const brands = buf.toString("ascii", 8, 32);
+  return (
+    brands.includes("heic") ||
+    brands.includes("heif") ||
+    brands.includes("mif1") ||
+    brands.includes("msf1")
+  );
+}
+
 // ---------- Core converters ----------
 
 async function toJpegWithSharp(inputBuffer) {
-  return sharp(inputBuffer, {
-    failOnError: false,
-    // Safety: avoid decompression bombs
-    limitInputPixels: 200e6,
-  })
+  return sharp(inputBuffer, { failOnError: false, limitInputPixels: 200e6 })
     .rotate()
     .jpeg({ quality: 100, chromaSubsampling: "4:4:4" })
     .toBuffer();
 }
 
-async function toJpegWithFfmpeg(inputBuffer) {
-  const id = randomUUID();
-  const inPath = `/tmp/${id}.bin`; // ffmpeg probes; extension not required
-  const outPath = `/tmp/${id}.jpg`;
+async function heicToJpegWithWasm(inputBuffer) {
+  // Decode HEIC/HEIF to raw RGBA using libheif-js (WASM)
+  const decoder = new libheif.HeifDecoder();
+  const images = decoder.decode(inputBuffer);
 
-  await fs.writeFile(inPath, inputBuffer);
-
-  await execFilePromise("ffmpeg", [
-    "-y",
-    "-v",
-    "error",
-    "-i",
-    inPath,
-    "-frames:v",
-    "1",
-    "-q:v",
-    "1", // high-quality JPEG from ffmpeg
-    outPath,
-  ]);
-
-  const jpg = await fs.readFile(outPath);
-
-  // Normalize output with sharp to enforce consistent settings (quality 100, 4:4:4)
-  return toJpegWithSharp(jpg);
-}
-
-async function toJpegWithImagemagick(inputBuffer) {
-  const id = randomUUID();
-  const inPath = `/tmp/${id}.bin`;
-  const outPath = `/tmp/${id}.jpg`;
-
-  await fs.writeFile(inPath, inputBuffer);
-
-  // ImageMagick 7 uses `magick`; IM6 uses `convert`
-  // We'll try `magick` first, then fallback to `convert`.
-  const args = [inPath, "-auto-orient", "-quality", "100", outPath];
-
-  try {
-    await execFilePromise("magick", args);
-  } catch (e) {
-    // If magick isn't installed, IM6 usually provides `convert`
-    await execFilePromise("convert", args);
+  if (!images || images.length === 0) {
+    throw new Error("WASM HEIF decode produced no images");
   }
 
-  const jpg = await fs.readFile(outPath);
-  return toJpegWithSharp(jpg);
+  const img = images[0];
+
+  // libheif-js exposes width/height; decode to RGBA
+  const width = img.get_width();
+  const height = img.get_height();
+
+  const rgba = img.display({ data: null, width, height, channels: 4 });
+
+  // Encode to JPEG with sharp (consistent settings)
+  return sharp(Buffer.from(rgba.data), { raw: { width, height, channels: 4 } })
+    .jpeg({ quality: 100, chromaSubsampling: "4:4:4" })
+    .toBuffer();
 }
 
 async function pdfFirstPageToJpeg(inputBuffer, dpi = 300) {
@@ -113,7 +97,6 @@ async function pdfFirstPageToJpeg(inputBuffer, dpi = 300) {
 
 // ---------- Endpoints ----------
 
-// Single JPEG output (images + PDF first page)
 app.post("/convert", async (req, res) => {
   try {
     if (!requireAuth(req, res)) return;
@@ -128,21 +111,20 @@ app.post("/convert", async (req, res) => {
       return res.status(200).send(jpeg);
     }
 
-    // Non-PDF: sharp -> ffmpeg -> imagemagick
+    // Try sharp first
     try {
       const jpeg = await toJpegWithSharp(input);
       res.setHeader("Content-Type", "image/jpeg");
       return res.status(200).send(jpeg);
-    } catch (e1) {
-      try {
-        const jpeg = await toJpegWithFfmpeg(input);
-        res.setHeader("Content-Type", "image/jpeg");
-        return res.status(200).send(jpeg);
-      } catch (e2) {
-        const jpeg = await toJpegWithImagemagick(input);
+    } catch (sharpErr) {
+      // If it looks like HEIC/HEIF, use WASM decoder (bulletproof)
+      if (looksLikeHeic(input)) {
+        const jpeg = await heicToJpegWithWasm(input);
         res.setHeader("Content-Type", "image/jpeg");
         return res.status(200).send(jpeg);
       }
+      // Otherwise bubble up (or add more fallbacks later if desired)
+      throw sharpErr;
     }
   } catch (e) {
     console.error(e);
@@ -159,12 +141,9 @@ app.post("/convert/pdf", async (req, res) => {
     if (!input || input.length === 0) return res.status(400).send("Empty body");
 
     if (!isPdfRequest(req)) {
-      return res
-        .status(415)
-        .send("This endpoint only accepts PDFs (Content-Type: application/pdf)");
+      return res.status(415).send("This endpoint only accepts PDFs");
     }
 
-    // Safety limits
     const dpi = clampInt(req.headers["x-pdf-dpi"], 72, 600, 300);
     const maxPages = clampInt(req.headers["x-pdf-max-pages"], 1, 200, 50);
 
@@ -176,13 +155,7 @@ app.post("/convert/pdf", async (req, res) => {
     await fs.mkdir(outDir, { recursive: true });
     await fs.writeFile(pdfPath, input);
 
-    await execFilePromise("pdftoppm", [
-      "-jpeg",
-      "-r",
-      String(dpi),
-      pdfPath,
-      outPrefix,
-    ]);
+    await execFilePromise("pdftoppm", ["-jpeg", "-r", String(dpi), pdfPath, outPrefix]);
 
     const files = (await fs.readdir(outDir))
       .filter((f) => /^page-\d+\.jpg$/i.test(f))
@@ -190,17 +163,12 @@ app.post("/convert/pdf", async (req, res) => {
 
     if (files.length === 0) return res.status(500).send("PDF render produced no pages");
     if (files.length > maxPages) {
-      return res
-        .status(413)
-        .send(`PDF has ${files.length} pages; exceeds maxPages=${maxPages}`);
+      return res.status(413).send(`PDF has ${files.length} pages; exceeds maxPages=${maxPages}`);
     }
 
     res.status(200);
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="pdf-pages-${id}.zip"`
-    );
+    res.setHeader("Content-Disposition", `attachment; filename="pdf-pages-${id}.zip"`);
 
     const archive = archiver("zip", { zlib: { level: 6 } });
     archive.on("error", (err) => {
