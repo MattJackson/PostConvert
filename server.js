@@ -58,6 +58,33 @@ async function toJpegWithSharp(inputBuffer) {
     .toBuffer();
 }
 
+function heifDisplayToRGBA(img) {
+  // libheif-js uses a callback-style async `display(bufferObj, cb)`
+  return new Promise((resolve, reject) => {
+    try {
+      const width = img.get_width();
+      const height = img.get_height();
+
+      const rgba = new Uint8Array(width * height * 4);
+      const bufObj = { data: rgba, width, height, channels: 4 };
+
+      img.display(bufObj, (out) => {
+        // out can be null on failure
+        if (!out || !out.data) {
+          return reject(new Error("libheif-js display() failed (returned null)"));
+        }
+        return resolve({
+          width,
+          height,
+          rgba: out.data instanceof Uint8Array ? out.data : rgba,
+        });
+      });
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
 async function heicToJpegWithWasm(inputBuffer) {
   if (!libheif?.HeifDecoder) {
     throw new Error("libheif-js not available (HeifDecoder missing)");
@@ -71,26 +98,10 @@ async function heicToJpegWithWasm(inputBuffer) {
   }
 
   const img = images[0];
-  const width = img.get_width();
-  const height = img.get_height();
-
-  // Allocate RGBA output buffer and ask libheif-js to fill it
-  const rgba = new Uint8Array(width * height * 4);
-
-  // Different libheif-js versions behave slightly differently:
-  // - some fill the provided `data` buffer and return undefined
-  // - some return an object with { data: <typed array> }
-  const result = img.display({ data: rgba, width, height, channels: 4 });
-
-  const pixelData =
-    result?.data instanceof Uint8Array
-      ? result.data
-      : result?.data
-        ? new Uint8Array(result.data)
-        : rgba;
+  const { width, height, rgba } = await heifDisplayToRGBA(img);
 
   // Encode to JPEG with sharp (consistent output settings)
-  return sharp(Buffer.from(pixelData), { raw: { width, height, channels: 4 } })
+  return sharp(Buffer.from(rgba), { raw: { width, height, channels: 4 } })
     .jpeg({ quality: 100, chromaSubsampling: "4:4:4" })
     .toBuffer();
 }
