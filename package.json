@@ -1,7 +1,10 @@
 {
-  "name": "heic-converter",
+  "name": "postconvert",
   "type": "module",
   "private": true,
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "express": "^4.19.2",
     "sharp": "^0.33.5",
