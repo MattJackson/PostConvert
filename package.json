@@ -1,13 +1,11 @@
 {
-  "name": "postconvert",
+  "name": "heic-converter",
   "type": "module",
   "private": true,
-  "engines": {
-    "node": ">=20"
-  },
   "dependencies": {
     "express": "^4.19.2",
     "sharp": "^0.33.5",
-    "archiver": "^6.0.2"
+    "archiver": "^6.0.2",
+    "libheif-js": "^1.18.0"
   }
 }
