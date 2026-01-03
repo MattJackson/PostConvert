@@ -1,8 +1,7 @@
-FROM node:20-bookworm-slim
+# Sharp-maintained runtime with libvips prebuilt (better HEIF success rate)
+FROM ghcr.io/lovell/sharp-node:20
 
 RUN apt-get update && apt-get install -y \
-  libheif1 libheif-dev \
-  libvips libvips-dev \
   ffmpeg \
   poppler-utils \
   imagemagick \
