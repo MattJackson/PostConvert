@@ -2,7 +2,6 @@ import express from "express";
 import sharp from "sharp";
 import { execFile } from "child_process";
 import fs from "fs/promises";
-import { createReadStream } from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 import archiver from "archiver";
@@ -17,13 +16,62 @@ app.use(express.raw({ type: "*/*", limit: "30mb" }));
 app.get("/", (_req, res) => res.status(200).send("postconvert: ok"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
+// ---------------- Request context / logging ----------------
+
+const DEFAULT_REQ_TIMEOUT_MS = clampInt(process.env.REQ_TIMEOUT_MS, 5_000, 10 * 60_000, 120_000);
+
+app.use((req, res, next) => {
+  const requestId = String(req.headers["x-request-id"] || "").trim() || randomUUID();
+  req.requestId = requestId;
+
+  res.setHeader("x-request-id", requestId);
+
+  const started = Date.now();
+  req.setTimeout(DEFAULT_REQ_TIMEOUT_MS);
+  res.setTimeout(DEFAULT_REQ_TIMEOUT_MS);
+
+  res.on("finish", () => {
+    const ms = Date.now() - started;
+    const len = Number(req.headers["content-length"] || 0) || (req.body?.length ?? 0) || 0;
+    console.log(
+      JSON.stringify({
+        requestId,
+        method: req.method,
+        path: req.originalUrl,
+        status: res.statusCode,
+        contentType: req.headers["content-type"] || null,
+        bytesIn: len,
+        ms,
+      })
+    );
+  });
+
+  next();
+});
+
+function isAborted(req, res) {
+  return Boolean(req.aborted || res.writableEnded || res.destroyed);
+}
+
+function sendError(res, status, code, message, requestId) {
+  if (res.headersSent) {
+    try {
+      res.end();
+    } catch {}
+    return;
+  }
+  res.status(status);
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.send(JSON.stringify({ error: code, message, requestId }));
+}
+
 // ---------------- Auth ----------------
 
 function requireAuth(req, res) {
   const token = process.env.CONVERTER_TOKEN;
   const auth = req.headers.authorization || "";
   if (!token || auth !== `Bearer ${token}`) {
-    res.status(401).send("Unauthorized");
+    sendError(res, 401, "unauthorized", "Unauthorized", req.requestId);
     return false;
   }
   return true;
@@ -54,8 +102,23 @@ function looksLikeHeic(buf) {
     brands.includes("hevx") ||
     brands.includes("mif1") ||
     brands.includes("msf1")
-    // If you want to treat AVIF similarly, add: || brands.includes("avif")
   );
+}
+
+async function assertSupportedRasterImage(input, req) {
+  // If it’s HEIC/HEIF, sharp may fail metadata; allow it through to WASM path.
+  if (looksLikeHeic(input)) return;
+
+  // Quick probe: if sharp can’t read metadata, treat it as unsupported (415).
+  try {
+    await sharp(input, { failOnError: false }).metadata();
+  } catch {
+    const ct = String(req.headers["content-type"] || "unknown");
+    throw Object.assign(new Error(`Unsupported input (not a decodable image). content-type=${ct}`), {
+      statusCode: 415,
+      code: "unsupported_media_type",
+    });
+  }
 }
 
 // ---------------- Resize / Quality options ----------------
@@ -66,6 +129,10 @@ function looksLikeHeic(buf) {
 //  - x-height: px (optional)
 //  - x-fit: inside|cover|contain|fill|outside (default inside)
 //  - x-without-enlargement: true|false (default true)
+//
+// PDF headers:
+//  - x-pdf-dpi: 72..600 (default 300)
+//  - x-pdf-max-pages: 1..200 (default 50)
 
 function parseBool(v, fallback = false) {
   if (v == null) return fallback;
@@ -84,9 +151,7 @@ function parseResizeOptions(req) {
   const maxDim = clampInt(req.headers["x-max-dimension"], 1, 20000, 0) || null;
 
   const fitRaw = String(req.headers["x-fit"] || "inside").toLowerCase();
-  const fit = ["inside", "cover", "contain", "fill", "outside"].includes(fitRaw)
-    ? fitRaw
-    : "inside";
+  const fit = ["inside", "cover", "contain", "fill", "outside"].includes(fitRaw) ? fitRaw : "inside";
 
   const withoutEnlargement = parseBool(req.headers["x-without-enlargement"], true);
 
@@ -113,11 +178,11 @@ function applyResizeAndJpeg(pipeline, opts) {
     });
   }
 
-  // JPEG encode. mozjpeg requires sharp build support; if unavailable, sharp ignores it.
   return pipeline.jpeg({
     quality,
     chromaSubsampling: "4:4:4",
     mozjpeg: true,
+    progressive: true,
   });
 }
 
@@ -186,19 +251,11 @@ async function pdfFirstPageToJpeg(inputBuffer, opts, dpi = 300) {
   try {
     await fs.writeFile(pdfPath, inputBuffer);
 
-    await execFilePromise("pdftoppm", [
-      "-jpeg",
-      "-r",
-      String(dpi),
-      "-singlefile",
-      pdfPath,
-      outPrefix,
-    ]);
+    await execFilePromise("pdftoppm", ["-jpeg", "-r", String(dpi), "-singlefile", pdfPath, outPrefix]);
 
     const pageJpg = await fs.readFile(`${outPrefix}.jpg`);
     return toJpegWithSharp(pageJpg, opts);
   } finally {
-    // best-effort cleanup
     await safeUnlink(pdfPath);
     await safeUnlink(`${outPrefix}.jpg`);
   }
@@ -208,45 +265,70 @@ async function pdfFirstPageToJpeg(inputBuffer, opts, dpi = 300) {
 
 // Single JPEG output (images + PDF first page)
 app.post("/convert", async (req, res) => {
+  const requestId = req.requestId;
+
   try {
     if (!requireAuth(req, res)) return;
+    if (isAborted(req, res)) return;
 
     const input = req.body;
-    if (!input || input.length === 0) return res.status(400).send("Empty body");
+    if (!input || input.length === 0) {
+      return sendError(res, 400, "empty_body", "Empty body", requestId);
+    }
 
     const opts = parseResizeOptions(req);
 
-    // PDF: always handle via poppler
+    // PDF: handle via poppler
     if (isPdfRequest(req)) {
       const jpeg = await pdfFirstPageToJpeg(input, opts, 300);
+      if (isAborted(req, res)) return;
+
       res.setHeader("Content-Type", "image/jpeg");
       return res.status(200).send(jpeg);
     }
 
+    // Non-PDF: validate input is a decodable raster image (or HEIC)
+    await assertSupportedRasterImage(input, req);
+
     // Try sharp first (fast path)
     try {
       const jpeg = await toJpegWithSharp(input, opts);
+      if (isAborted(req, res)) return;
+
       res.setHeader("Content-Type", "image/jpeg");
       return res.status(200).send(jpeg);
     } catch (sharpErr) {
       // If it looks like HEIC/HEIF, decode via WASM and encode to JPEG
       if (looksLikeHeic(input)) {
         const jpeg = await heicToJpegWithWasm(input, opts);
+        if (isAborted(req, res)) return;
+
         res.setHeader("Content-Type", "image/jpeg");
         return res.status(200).send(jpeg);
       }
-
-      // Otherwise: return the original sharp error
       throw sharpErr;
     }
   } catch (e) {
-    console.error(e);
-    return res.status(500).send(String(e?.stack || e));
+    // Expected 415 from probe
+    if (e?.statusCode === 415) {
+      return sendError(res, 415, e.code || "unsupported_media_type", e.message, requestId);
+    }
+
+    console.error(JSON.stringify({ requestId, err: String(e?.stack || e) }));
+
+    // Don’t leak stack traces to clients
+    return sendError(res, 500, "conversion_failed", "Conversion failed", requestId);
   }
 });
 
 // PDF all pages -> ZIP of JPEG pages (supports resize/quality by re-encoding each page)
 app.post("/convert/pdf", async (req, res) => {
+  const requestId = req.requestId;
+
+  // More time for multi-page zips
+  req.setTimeout(clampInt(process.env.REQ_TIMEOUT_PDF_MS, 10_000, 30 * 60_000, 5 * 60_000));
+  res.setTimeout(clampInt(process.env.REQ_TIMEOUT_PDF_MS, 10_000, 30 * 60_000, 5 * 60_000));
+
   let archive = null;
 
   const id = randomUUID();
@@ -256,12 +338,15 @@ app.post("/convert/pdf", async (req, res) => {
 
   try {
     if (!requireAuth(req, res)) return;
+    if (isAborted(req, res)) return;
 
     const input = req.body;
-    if (!input || input.length === 0) return res.status(400).send("Empty body");
+    if (!input || input.length === 0) {
+      return sendError(res, 400, "empty_body", "Empty body", requestId);
+    }
 
     if (!isPdfRequest(req)) {
-      return res.status(415).send("This endpoint only accepts PDFs");
+      return sendError(res, 415, "unsupported_media_type", "This endpoint only accepts PDFs", requestId);
     }
 
     const opts = parseResizeOptions(req);
@@ -271,6 +356,8 @@ app.post("/convert/pdf", async (req, res) => {
     await fs.mkdir(outDir, { recursive: true });
     await fs.writeFile(pdfPath, input);
 
+    if (isAborted(req, res)) return;
+
     // Render all pages to JPG via poppler
     await execFilePromise("pdftoppm", ["-jpeg", "-r", String(dpi), pdfPath, outPrefix]);
 
@@ -278,9 +365,15 @@ app.post("/convert/pdf", async (req, res) => {
       .filter((f) => /^page-\d+\.jpg$/i.test(f))
       .sort((a, b) => pageNum(a) - pageNum(b));
 
-    if (files.length === 0) return res.status(500).send("PDF render produced no pages");
+    if (files.length === 0) return sendError(res, 500, "pdf_render_failed", "PDF render produced no pages", requestId);
     if (files.length > maxPages) {
-      return res.status(413).send(`PDF has ${files.length} pages; exceeds maxPages=${maxPages}`);
+      return sendError(
+        res,
+        413,
+        "pdf_too_many_pages",
+        `PDF has ${files.length} pages; exceeds maxPages=${maxPages}`,
+        requestId
+      );
     }
 
     res.status(200);
@@ -302,15 +395,19 @@ app.post("/convert/pdf", async (req, res) => {
     });
 
     archive.on("error", (err) => {
-      console.error(err);
-      if (!res.headersSent) res.status(500);
-      res.end();
+      console.error(JSON.stringify({ requestId, err: String(err?.stack || err) }));
+      try {
+        if (!res.headersSent) sendError(res, 500, "zip_failed", "ZIP creation failed", requestId);
+        else res.end();
+      } catch {}
     });
 
     archive.pipe(res);
 
     // Re-encode each rendered page with resize + quality controls, then append as buffers
     for (let i = 0; i < files.length; i++) {
+      if (isAborted(req, res)) break;
+
       const f = files[i];
       const n = String(i + 1).padStart(3, "0");
       const pagePath = path.join(outDir, f);
@@ -318,24 +415,43 @@ app.post("/convert/pdf", async (req, res) => {
       const pageBuf = await fs.readFile(pagePath);
       const jpegBuf = await toJpegWithSharp(pageBuf, opts);
 
+      if (isAborted(req, res)) break;
+
       archive.append(jpegBuf, { name: `${n}.jpg` });
     }
 
-    await archive.finalize();
+    if (!isAborted(req, res)) {
+      await archive.finalize();
+    }
   } catch (e) {
-    console.error(e);
-    return res.status(500).send(String(e?.stack || e));
+    console.error(JSON.stringify({ requestId, err: String(e?.stack || e) }));
+
+    // If we already started streaming a zip, we can’t reliably send JSON.
+    if (res.headersSent) {
+      try {
+        res.end();
+      } catch {}
+      return;
+    }
+
+    // ENOENT (pdftoppm missing) or other exec failures should be clear, but still not leak stack.
+    const msg =
+      String(e?.message || "").includes("Missing dependency: pdftoppm") ||
+      String(e?.message || "").includes("ENOENT")
+        ? "Server missing PDF rendering dependency"
+        : "Conversion failed";
+
+    return sendError(res, 500, "conversion_failed", msg, requestId);
   } finally {
-    // Best-effort cleanup for PDF zip path
     await safeUnlink(pdfPath);
     await safeRmrf(outDir);
   }
 });
 
 // Oversize handler
-app.use((err, _req, res, next) => {
+app.use((err, req, res, next) => {
   if (err?.type === "entity.too.large") {
-    return res.status(413).send("Payload too large (max 30mb)");
+    return sendError(res, 413, "payload_too_large", "Payload too large (max 30mb)", req.requestId);
   }
   return next(err);
 });
@@ -350,7 +466,14 @@ app.listen(port, "0.0.0.0", () => {
 function execFilePromise(cmd, args) {
   return new Promise((resolve, reject) => {
     execFile(cmd, args, (err, _stdout, stderr) => {
-      if (err) reject(new Error(stderr || String(err)));
+      if (err) {
+        // Provide clearer missing-binary errors
+        if (err.code === "ENOENT") {
+          return reject(new Error(`Missing dependency: ${cmd} (not found in PATH)`));
+        }
+        const meta = `cmd=${cmd} code=${err.code || "unknown"} signal=${err.signal || "none"}`;
+        return reject(new Error(`${meta}${stderr ? `; stderr=${stderr}` : ""}`));
+      }
       else resolve();
     });
   });
