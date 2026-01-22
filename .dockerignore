@@ -1,3 +1,31 @@
+# Dependencies
 node_modules
 npm-debug.log
+yarn-error.log
+pnpm-debug.log
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets
+credentials
+
+# Git / VCS
+.git
+.gitignore
+
+# OS / editor junk
 .DS_Store
+Thumbs.db
+.vscode
+.idea
+
+# Logs / coverage
+logs
+*.log
+c
