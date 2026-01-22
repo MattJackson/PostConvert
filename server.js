@@ -18,7 +18,16 @@ app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 // ---------------- Request context / logging ----------------
 
+// Defaults can be overridden by env vars.
+// - REQ_TIMEOUT_MS: general request timeout
+// - REQ_TIMEOUT_PDF_MS: longer timeout for multi-page PDF zips
 const DEFAULT_REQ_TIMEOUT_MS = clampInt(process.env.REQ_TIMEOUT_MS, 5_000, 10 * 60_000, 120_000);
+const DEFAULT_REQ_TIMEOUT_PDF_MS = clampInt(
+  process.env.REQ_TIMEOUT_PDF_MS,
+  10_000,
+  30 * 60_000,
+  5 * 60_000
+);
 
 app.use((req, res, next) => {
   const requestId = String(req.headers["x-request-id"] || "").trim() || randomUUID();
@@ -109,7 +118,6 @@ async function assertSupportedRasterImage(input, req) {
   // If it’s HEIC/HEIF, sharp may fail metadata; allow it through to WASM path.
   if (looksLikeHeic(input)) return;
 
-  // Quick probe: if sharp can’t read metadata, treat it as unsupported (415).
   try {
     await sharp(input, { failOnError: false }).metadata();
   } catch {
@@ -261,6 +269,93 @@ async function pdfFirstPageToJpeg(inputBuffer, opts, dpi = 300) {
   }
 }
 
+/**
+ * Page-by-page PDF rendering:
+ * Uses pdftoppm -f N -l N -singlefile to render one page at a time,
+ * keeping /tmp usage bounded (one rendered JPEG at a time).
+ *
+ * Returns { produced: number }.
+ */
+async function pdfPagesToZipStreamPageByPage({
+  inputPdfBuffer,
+  res,
+  req,
+  opts,
+  dpi,
+  maxPages,
+  outNamePrefix = "page",
+}) {
+  const requestId = req.requestId;
+  const jobId = randomUUID();
+
+  const pdfPath = `/tmp/${jobId}.pdf`;
+  const outPrefix = `/tmp/${jobId}-${outNamePrefix}`; // pdftoppm writes `${outPrefix}.jpg`
+
+  let produced = 0;
+
+  try {
+    await fs.writeFile(pdfPath, inputPdfBuffer);
+
+    for (let page = 1; page <= maxPages; page++) {
+      if (isAborted(req, res)) break;
+
+      // Render a single page to `${outPrefix}.jpg`
+      await execFilePromise("pdftoppm", [
+        "-jpeg",
+        "-r",
+        String(dpi),
+        "-f",
+        String(page),
+        "-l",
+        String(page),
+        "-singlefile",
+        pdfPath,
+        outPrefix,
+      ]);
+
+      const renderedPath = `${outPrefix}.jpg`;
+
+      // If pdftoppm produced nothing (EOF), stop cleanly.
+      let pageBuf;
+      try {
+        pageBuf = await fs.readFile(renderedPath);
+      } catch (e) {
+        // If it didn't write the file, assume we're past the last page.
+        // (Could also be a failure; but pdftoppm errors should have thrown above.)
+        break;
+      }
+
+      if (isAborted(req, res)) {
+        await safeUnlink(renderedPath);
+        break;
+      }
+
+      const jpegBuf = await toJpegWithSharp(pageBuf, opts);
+      await safeUnlink(renderedPath);
+
+      if (isAborted(req, res)) break;
+
+      const n = String(page).padStart(3, "0");
+      res.archive.append(jpegBuf, { name: `${n}.jpg` });
+      produced++;
+    }
+
+    if (produced === 0 && !isAborted(req, res)) {
+      // If we produced nothing, treat as PDF render failure.
+      throw new Error("PDF render produced no pages");
+    }
+
+    return { produced };
+  } catch (e) {
+    console.error(JSON.stringify({ requestId, err: String(e?.stack || e) }));
+    throw e;
+  } finally {
+    await safeUnlink(pdfPath);
+    // renderedPath cleaned each iteration; safe cleanup in case of partial failures:
+    await safeUnlink(`${outPrefix}.jpg`);
+  }
+}
+
 // ---------------- Endpoints ----------------
 
 // Single JPEG output (images + PDF first page)
@@ -309,32 +404,24 @@ app.post("/convert", async (req, res) => {
       throw sharpErr;
     }
   } catch (e) {
-    // Expected 415 from probe
     if (e?.statusCode === 415) {
       return sendError(res, 415, e.code || "unsupported_media_type", e.message, requestId);
     }
 
     console.error(JSON.stringify({ requestId, err: String(e?.stack || e) }));
-
-    // Don’t leak stack traces to clients
     return sendError(res, 500, "conversion_failed", "Conversion failed", requestId);
   }
 });
 
-// PDF all pages -> ZIP of JPEG pages (supports resize/quality by re-encoding each page)
+// PDF all pages -> ZIP of JPEG pages (page-by-page rendering to keep /tmp bounded)
 app.post("/convert/pdf", async (req, res) => {
   const requestId = req.requestId;
 
   // More time for multi-page zips
-  req.setTimeout(clampInt(process.env.REQ_TIMEOUT_PDF_MS, 10_000, 30 * 60_000, 5 * 60_000));
-  res.setTimeout(clampInt(process.env.REQ_TIMEOUT_PDF_MS, 10_000, 30 * 60_000, 5 * 60_000));
+  req.setTimeout(DEFAULT_REQ_TIMEOUT_PDF_MS);
+  res.setTimeout(DEFAULT_REQ_TIMEOUT_PDF_MS);
 
   let archive = null;
-
-  const id = randomUUID();
-  const pdfPath = `/tmp/${id}.pdf`;
-  const outDir = `/tmp/${id}-pages`;
-  const outPrefix = path.join(outDir, "page");
 
   try {
     if (!requireAuth(req, res)) return;
@@ -353,34 +440,14 @@ app.post("/convert/pdf", async (req, res) => {
     const dpi = clampInt(req.headers["x-pdf-dpi"], 72, 600, 300);
     const maxPages = clampInt(req.headers["x-pdf-max-pages"], 1, 200, 50);
 
-    await fs.mkdir(outDir, { recursive: true });
-    await fs.writeFile(pdfPath, input);
-
-    if (isAborted(req, res)) return;
-
-    // Render all pages to JPG via poppler
-    await execFilePromise("pdftoppm", ["-jpeg", "-r", String(dpi), pdfPath, outPrefix]);
-
-    const files = (await fs.readdir(outDir))
-      .filter((f) => /^page-\d+\.jpg$/i.test(f))
-      .sort((a, b) => pageNum(a) - pageNum(b));
-
-    if (files.length === 0) return sendError(res, 500, "pdf_render_failed", "PDF render produced no pages", requestId);
-    if (files.length > maxPages) {
-      return sendError(
-        res,
-        413,
-        "pdf_too_many_pages",
-        `PDF has ${files.length} pages; exceeds maxPages=${maxPages}`,
-        requestId
-      );
-    }
-
     res.status(200);
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", `attachment; filename="pdf-pages-${id}.zip"`);
+    res.setHeader("Content-Disposition", `attachment; filename="pdf-pages-${randomUUID()}.zip"`);
 
     archive = archiver("zip", { zlib: { level: 6 } });
+
+    // Attach archive to res for the helper
+    res.archive = archive;
 
     // Abort work if client disconnects
     res.on("close", () => {
@@ -397,28 +464,22 @@ app.post("/convert/pdf", async (req, res) => {
     archive.on("error", (err) => {
       console.error(JSON.stringify({ requestId, err: String(err?.stack || err) }));
       try {
-        if (!res.headersSent) sendError(res, 500, "zip_failed", "ZIP creation failed", requestId);
-        else res.end();
+        // If we already started streaming, we can only end.
+        res.end();
       } catch {}
     });
 
     archive.pipe(res);
 
-    // Re-encode each rendered page with resize + quality controls, then append as buffers
-    for (let i = 0; i < files.length; i++) {
-      if (isAborted(req, res)) break;
-
-      const f = files[i];
-      const n = String(i + 1).padStart(3, "0");
-      const pagePath = path.join(outDir, f);
-
-      const pageBuf = await fs.readFile(pagePath);
-      const jpegBuf = await toJpegWithSharp(pageBuf, opts);
-
-      if (isAborted(req, res)) break;
-
-      archive.append(jpegBuf, { name: `${n}.jpg` });
-    }
+    // Render and append pages one-at-a-time
+    await pdfPagesToZipStreamPageByPage({
+      inputPdfBuffer: input,
+      res,
+      req,
+      opts,
+      dpi,
+      maxPages,
+    });
 
     if (!isAborted(req, res)) {
       await archive.finalize();
@@ -434,17 +495,12 @@ app.post("/convert/pdf", async (req, res) => {
       return;
     }
 
-    // ENOENT (pdftoppm missing) or other exec failures should be clear, but still not leak stack.
     const msg =
-      String(e?.message || "").includes("Missing dependency: pdftoppm") ||
-      String(e?.message || "").includes("ENOENT")
+      String(e?.message || "").includes("Missing dependency: pdftoppm") || String(e?.message || "").includes("ENOENT")
         ? "Server missing PDF rendering dependency"
         : "Conversion failed";
 
     return sendError(res, 500, "conversion_failed", msg, requestId);
-  } finally {
-    await safeUnlink(pdfPath);
-    await safeRmrf(outDir);
   }
 });
 
@@ -467,21 +523,15 @@ function execFilePromise(cmd, args) {
   return new Promise((resolve, reject) => {
     execFile(cmd, args, (err, _stdout, stderr) => {
       if (err) {
-        // Provide clearer missing-binary errors
         if (err.code === "ENOENT") {
           return reject(new Error(`Missing dependency: ${cmd} (not found in PATH)`));
         }
         const meta = `cmd=${cmd} code=${err.code || "unknown"} signal=${err.signal || "none"}`;
         return reject(new Error(`${meta}${stderr ? `; stderr=${stderr}` : ""}`));
       }
-      else resolve();
+      resolve();
     });
   });
-}
-
-function pageNum(filename) {
-  const m = filename.match(/page-(\d+)\.jpg/i);
-  return m ? Number(m[1]) : 0;
 }
 
 function clampInt(value, min, max, fallback) {
@@ -497,9 +547,3 @@ async function safeUnlink(p) {
   } catch {}
 }
 
-async function safeRmrf(p) {
-  if (!p) return;
-  try {
-    await fs.rm(p, { recursive: true, force: true });
-  } catch {}
-}
