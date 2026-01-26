@@ -3,7 +3,6 @@ import sharp from "sharp";
 import { execFile } from "child_process";
 import fs from "fs/promises";
 import { randomUUID } from "crypto";
-import archiver from "archiver";
 
 import libheifModule from "libheif-js";
 const libheif = libheifModule?.default ?? libheifModule;
@@ -31,6 +30,10 @@ const DEFAULT_REQ_TIMEOUT_PDF_MS = clampInt(
   30 * 60_000,
   5 * 60_000
 );
+
+// If your platform hard-limits concurrent connections to 1, set this to 1.
+const MAX_INFLIGHT = clampInt(process.env.MAX_INFLIGHT, 1, 16, 1);
+let inflight = 0;
 
 app.use((req, res, next) => {
   const requestId =
@@ -118,15 +121,15 @@ function looksLikeHeic(buf) {
   );
 }
 
-async function assertSupportedRaster(input, req) {
+async function assertSupportedRaster(input) {
   if (looksLikeHeic(input)) return;
   try {
     await sharp(input, { failOnError: false }).metadata();
   } catch {
-    throw Object.assign(
-      new Error("Unsupported image input"),
-      { statusCode: 415, code: "unsupported_media_type" }
-    );
+    throw Object.assign(new Error("Unsupported image input"), {
+      statusCode: 415,
+      code: "unsupported_media_type",
+    });
   }
 }
 
@@ -148,6 +151,8 @@ function parseOptions(req) {
     maxDim: clampInt(req.headers["x-max-dimension"], 500, 6000, 2000),
     fit: "inside",
     withoutEnlargement: parseBool(req.headers["x-without-enlargement"], true),
+    // allow callers to request higher-res PDF rendering if they want
+    pdfDpi: clampInt(req.headers["x-pdf-dpi"], 72, 600, 300),
   };
 }
 
@@ -156,12 +161,17 @@ function parseOptions(req) {
 /* ------------------------------------------------------------------ */
 
 function normalizeForVision(input, opts) {
-  let pipeline = sharp(input, {
+  // IMPORTANT:
+  // If opts.raw is present, Sharp must be told it's raw pixel data.
+  const sharpInputOpts = {
     failOnError: false,
     limitInputPixels: 200e6,
-  })
-    .rotate()               // apply EXIF orientation
-    .toColorspace("rgb");   // normalize colorspace
+    ...(opts?.raw ? { raw: opts.raw } : {}),
+  };
+
+  let pipeline = sharp(input, sharpInputOpts)
+    .rotate() // apply EXIF orientation (no-op for raw)
+    .toColorspace("rgb"); // normalize colorspace
 
   if (opts.maxDim) {
     pipeline = pipeline.resize({
@@ -172,6 +182,7 @@ function normalizeForVision(input, opts) {
     });
   }
 
+  // Strip all metadata by default (Vision/transport safe).
   return pipeline
     .jpeg({
       quality: opts.quality,
@@ -179,7 +190,7 @@ function normalizeForVision(input, opts) {
       mozjpeg: true,
       progressive: true,
     })
-    .withMetadata(false) // explicit: strip ALL metadata
+    .withMetadata(false)
     .toBuffer();
 }
 
@@ -203,39 +214,40 @@ function heifDisplayToRGBA(img) {
 }
 
 async function heicToJpeg(input, opts) {
-  if (!libheif?.HeifDecoder) {
-    throw new Error("libheif-js unavailable");
-  }
+  if (!libheif?.HeifDecoder) throw new Error("libheif-js unavailable");
   const dec = new libheif.HeifDecoder();
   const imgs = dec.decode(input);
   if (!imgs?.length) throw new Error("HEIC decode failed");
 
   const { width, height, rgba } = await heifDisplayToRGBA(imgs[0]);
-  return normalizeForVision(
-    Buffer.from(rgba),
-    { ...opts, raw: { width, height, channels: 4 } }
-  );
+
+  // Feed raw pixels correctly:
+  return normalizeForVision(Buffer.from(rgba), {
+    ...opts,
+    raw: { width, height, channels: 4 },
+  });
 }
 
 /* ------------------------------------------------------------------ */
 /* PDF handling                                                       */
 /* ------------------------------------------------------------------ */
 
-async function pdfFirstPageToJpeg(input, opts, dpi = 300) {
+async function pdfFirstPageToJpeg(input, opts) {
   const id = randomUUID();
   const pdf = `/tmp/${id}.pdf`;
   const out = `/tmp/${id}.jpg`;
 
   try {
     await fs.writeFile(pdf, input);
-    await execFilePromise("pdftoppm", [
-      "-jpeg",
-      "-singlefile",
-      "-r",
-      String(dpi),
-      pdf,
-      `/tmp/${id}`,
-    ]);
+
+    // Give PDFs their own longer timeout budget.
+    // (Also helps platforms that kill "stuck" requests.)
+    await execFilePromise(
+      "pdftoppm",
+      ["-jpeg", "-singlefile", "-r", String(opts.pdfDpi), pdf, `/tmp/${id}`],
+      DEFAULT_REQ_TIMEOUT_PDF_MS
+    );
+
     const buf = await fs.readFile(out);
     return normalizeForVision(buf, opts);
   } finally {
@@ -245,58 +257,115 @@ async function pdfFirstPageToJpeg(input, opts, dpi = 300) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Concurrency gate (single-flight)                                   */
+/* ------------------------------------------------------------------ */
+
+async function withInflightLimit(req, res, fn) {
+  if (inflight >= MAX_INFLIGHT) {
+    // If your instance hard-limits concurrent connections, returning 503 fast
+    // prevents health check failures and connection pileups.
+    return sendError(
+      res,
+      503,
+      "busy",
+      "Converter busy; retry shortly",
+      req.requestId
+    );
+  }
+
+  inflight++;
+  try {
+    return await fn();
+  } finally {
+    inflight--;
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Routes                                                             */
 /* ------------------------------------------------------------------ */
 
 app.post("/convert", async (req, res) => {
-  try {
-    if (!requireAuth(req, res)) return;
-    if (!req.body?.length)
-      return sendError(res, 400, "empty_body", "Empty body", req.requestId);
+  // If your platform counts keep-alive as an active connection, close quickly.
+  res.setHeader("Connection", "close");
 
-    const opts = parseOptions(req);
-
-    if (isPdfRequest(req)) {
-      const jpeg = await pdfFirstPageToJpeg(req.body, opts);
-      res.setHeader("Content-Type", "image/jpeg");
-      return res.send(jpeg);
-    }
-
-    await assertSupportedRaster(req.body, req);
-
+  return withInflightLimit(req, res, async () => {
     try {
-      const jpeg = await normalizeForVision(req.body, opts);
-      res.setHeader("Content-Type", "image/jpeg");
-      return res.send(jpeg);
-    } catch {
-      if (looksLikeHeic(req.body)) {
-        const jpeg = await heicToJpeg(req.body, opts);
+      if (!requireAuth(req, res)) return;
+
+      if (!req.body?.length) {
+        return sendError(res, 400, "empty_body", "Empty body", req.requestId);
+      }
+
+      const opts = parseOptions(req);
+
+      if (isPdfRequest(req)) {
+        if (isAborted(req, res)) return;
+        const jpeg = await pdfFirstPageToJpeg(req.body, opts);
+        if (isAborted(req, res)) return;
         res.setHeader("Content-Type", "image/jpeg");
         return res.send(jpeg);
       }
-      throw new Error("Image conversion failed");
+
+      // Fast sniff: if HEIC, go directly to HEIC decode path.
+      if (looksLikeHeic(req.body)) {
+        if (isAborted(req, res)) return;
+        const jpeg = await heicToJpeg(req.body, opts);
+        if (isAborted(req, res)) return;
+        res.setHeader("Content-Type", "image/jpeg");
+        return res.send(jpeg);
+      }
+
+      await assertSupportedRaster(req.body);
+
+      if (isAborted(req, res)) return;
+      const jpeg = await normalizeForVision(req.body, opts);
+      if (isAborted(req, res)) return;
+
+      res.setHeader("Content-Type", "image/jpeg");
+      return res.send(jpeg);
+    } catch (e) {
+      const status = e?.statusCode || 500;
+      const code = e?.code || "conversion_failed";
+
+      console.error(
+        JSON.stringify({
+          requestId: req.requestId,
+          err: String(e?.stack || e),
+        })
+      );
+
+      return sendError(
+        res,
+        status,
+        code,
+        status === 415 ? "Unsupported media type" : "Conversion failed",
+        req.requestId
+      );
     }
-  } catch (e) {
-    console.error(JSON.stringify({ requestId: req.requestId, err: String(e) }));
-    return sendError(res, 500, "conversion_failed", "Conversion failed", req.requestId);
-  }
+  });
 });
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
-function execFilePromise(cmd, args) {
+function execFilePromise(cmd, args, timeoutMs) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, (err, _stdout, stderr) => {
+    const child = execFile(cmd, args, { timeout: timeoutMs }, (err, _o, stderr) => {
       if (err) {
-        if (err.code === "ENOENT") {
-          reject(new Error(`Missing dependency: ${cmd}`));
-        } else {
-          reject(new Error(stderr || String(err)));
+        if (err.code === "ENOENT") return reject(new Error(`Missing dependency: ${cmd}`));
+        if (err.killed || err.signal === "SIGTERM") {
+          return reject(new Error(`${cmd} timed out after ${timeoutMs}ms`));
         }
-      } else resolve();
+        return reject(new Error(stderr || String(err)));
+      }
+      resolve();
     });
+
+    // Best-effort: if the parent request is gone, the route checks isAborted(),
+    // but this protects against orphaned converters in some environments.
+    child.on("error", () => {});
   });
 }
 
@@ -315,6 +384,10 @@ async function safeUnlink(p) {
 /* ------------------------------------------------------------------ */
 
 const port = Number(process.env.PORT) || 8080;
-app.listen(port, "0.0.0.0", () =>
+const server = app.listen(port, "0.0.0.0", () =>
   console.log(`converter listening on :${port}`)
 );
+
+// Reduce lingering keep-alive sockets (helps strict connection caps).
+server.keepAliveTimeout = 5_000;
+server.headersTimeout = 10_000;
