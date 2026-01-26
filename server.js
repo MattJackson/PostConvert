@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import sharp from "sharp";
 import { execFile } from "child_process";
@@ -30,10 +31,6 @@ const DEFAULT_REQ_TIMEOUT_PDF_MS = clampInt(
   30 * 60_000,
   5 * 60_000
 );
-
-// If your platform hard-limits concurrent connections to 1, set this to 1.
-const MAX_INFLIGHT = clampInt(process.env.MAX_INFLIGHT, 1, 16, 1);
-let inflight = 0;
 
 app.use((req, res, next) => {
   const requestId =
@@ -134,7 +131,7 @@ async function assertSupportedRaster(input) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Resize / quality options                                           */
+/* Options                                                            */
 /* ------------------------------------------------------------------ */
 
 function parseBool(v, fallback = false) {
@@ -149,9 +146,7 @@ function parseOptions(req) {
   return {
     quality: clampInt(req.headers["x-jpeg-quality"], 40, 100, 85),
     maxDim: clampInt(req.headers["x-max-dimension"], 500, 6000, 2000),
-    fit: "inside",
     withoutEnlargement: parseBool(req.headers["x-without-enlargement"], true),
-    // allow callers to request higher-res PDF rendering if they want
     pdfDpi: clampInt(req.headers["x-pdf-dpi"], 72, 600, 300),
   };
 }
@@ -161,8 +156,6 @@ function parseOptions(req) {
 /* ------------------------------------------------------------------ */
 
 function normalizeForVision(input, opts) {
-  // IMPORTANT:
-  // If opts.raw is present, Sharp must be told it's raw pixel data.
   const sharpInputOpts = {
     failOnError: false,
     limitInputPixels: 200e6,
@@ -170,8 +163,8 @@ function normalizeForVision(input, opts) {
   };
 
   let pipeline = sharp(input, sharpInputOpts)
-    .rotate() // apply EXIF orientation (no-op for raw)
-    .toColorspace("rgb"); // normalize colorspace
+    .rotate()
+    .toColorspace("rgb");
 
   if (opts.maxDim) {
     pipeline = pipeline.resize({
@@ -182,7 +175,6 @@ function normalizeForVision(input, opts) {
     });
   }
 
-  // Strip all metadata by default (Vision/transport safe).
   return pipeline
     .jpeg({
       quality: opts.quality,
@@ -221,7 +213,7 @@ async function heicToJpeg(input, opts) {
 
   const { width, height, rgba } = await heifDisplayToRGBA(imgs[0]);
 
-  // Feed raw pixels correctly:
+  // IMPORTANT: feed Sharp raw pixel metadata so it doesn't treat the buffer as an encoded image
   return normalizeForVision(Buffer.from(rgba), {
     ...opts,
     raw: { width, height, channels: 4 },
@@ -240,8 +232,6 @@ async function pdfFirstPageToJpeg(input, opts) {
   try {
     await fs.writeFile(pdf, input);
 
-    // Give PDFs their own longer timeout budget.
-    // (Also helps platforms that kill "stuck" requests.)
     await execFilePromise(
       "pdftoppm",
       ["-jpeg", "-singlefile", "-r", String(opts.pdfDpi), pdf, `/tmp/${id}`],
@@ -257,13 +247,14 @@ async function pdfFirstPageToJpeg(input, opts) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Concurrency gate (single-flight)                                   */
+/* Single-flight per machine (ONLY for /convert)                       */
 /* ------------------------------------------------------------------ */
 
-async function withInflightLimit(req, res, fn) {
-  if (inflight >= MAX_INFLIGHT) {
-    // If your instance hard-limits concurrent connections, returning 503 fast
-    // prevents health check failures and connection pileups.
+const MAX_CONVERT_INFLIGHT = 1;
+let convertInflight = 0;
+
+async function withConvertSingleFlight(req, res, fn) {
+  if (convertInflight >= MAX_CONVERT_INFLIGHT) {
     return sendError(
       res,
       503,
@@ -272,12 +263,11 @@ async function withInflightLimit(req, res, fn) {
       req.requestId
     );
   }
-
-  inflight++;
+  convertInflight++;
   try {
     return await fn();
   } finally {
-    inflight--;
+    convertInflight--;
   }
 }
 
@@ -286,10 +276,10 @@ async function withInflightLimit(req, res, fn) {
 /* ------------------------------------------------------------------ */
 
 app.post("/convert", async (req, res) => {
-  // If your platform counts keep-alive as an active connection, close quickly.
+  // Encourage quick socket turnover; Fly will still manage concurrency.
   res.setHeader("Connection", "close");
 
-  return withInflightLimit(req, res, async () => {
+  return withConvertSingleFlight(req, res, async () => {
     try {
       if (!requireAuth(req, res)) return;
 
@@ -307,7 +297,6 @@ app.post("/convert", async (req, res) => {
         return res.send(jpeg);
       }
 
-      // Fast sniff: if HEIC, go directly to HEIC decode path.
       if (looksLikeHeic(req.body)) {
         if (isAborted(req, res)) return;
         const jpeg = await heicToJpeg(req.body, opts);
@@ -352,7 +341,7 @@ app.post("/convert", async (req, res) => {
 
 function execFilePromise(cmd, args, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const child = execFile(cmd, args, { timeout: timeoutMs }, (err, _o, stderr) => {
+    execFile(cmd, args, { timeout: timeoutMs }, (err, _stdout, stderr) => {
       if (err) {
         if (err.code === "ENOENT") return reject(new Error(`Missing dependency: ${cmd}`));
         if (err.killed || err.signal === "SIGTERM") {
@@ -362,10 +351,6 @@ function execFilePromise(cmd, args, timeoutMs) {
       }
       resolve();
     });
-
-    // Best-effort: if the parent request is gone, the route checks isAborted(),
-    // but this protects against orphaned converters in some environments.
-    child.on("error", () => {});
   });
 }
 
@@ -388,6 +373,6 @@ const server = app.listen(port, "0.0.0.0", () =>
   console.log(`converter listening on :${port}`)
 );
 
-// Reduce lingering keep-alive sockets (helps strict connection caps).
+// Reduce lingering keep-alive sockets
 server.keepAliveTimeout = 5_000;
 server.headersTimeout = 10_000;
