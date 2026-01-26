@@ -71,7 +71,9 @@ function isAborted(req, res) {
 
 function sendError(res, status, code, message, requestId) {
   if (res.headersSent) {
-    try { res.end(); } catch {}
+    try {
+      res.end();
+    } catch {}
     return;
   }
   res.status(status).json({ error: code, message, requestId });
@@ -160,9 +162,14 @@ function normalizeForVision(input, opts) {
     ...(opts?.raw ? { raw: opts.raw } : {}),
   };
 
-  let pipeline = sharp(input, sharpInputOpts)
-    .rotate()
-    .toColorspace("rgb");
+  let pipeline = sharp(input, sharpInputOpts).rotate();
+
+  // Normalize into sRGB (NOT "rgb"). This avoids:
+  // vips_colourspace: no known route from 'srgb' to 'rgb'
+  pipeline = pipeline.toColorspace("srgb");
+
+  // If input has alpha, flatten to white so OCR/vision doesn't get weird transparency artifacts.
+  pipeline = pipeline.flatten({ background: { r: 255, g: 255, b: 255 } });
 
   if (opts.maxDim) {
     pipeline = pipeline.resize({
@@ -211,6 +218,7 @@ async function heicToJpeg(input, opts) {
 
   const { width, height, rgba } = await heifDisplayToRGBA(imgs[0]);
 
+  // Feed Sharp raw pixel metadata so it doesn't treat the buffer as an encoded image.
   return normalizeForVision(Buffer.from(rgba), {
     ...opts,
     raw: { width, height, channels: 4 },
@@ -228,11 +236,13 @@ async function pdfFirstPageToJpeg(input, opts) {
 
   try {
     await fs.writeFile(pdf, input);
+
     await execFilePromise(
       "pdftoppm",
       ["-jpeg", "-singlefile", "-r", String(opts.pdfDpi), pdf, `/tmp/${id}`],
       DEFAULT_REQ_TIMEOUT_PDF_MS
     );
+
     const buf = await fs.readFile(out);
     return normalizeForVision(buf, opts);
   } finally {
@@ -251,13 +261,7 @@ let convertInflight = 0;
 async function withConvertSingleFlight(req, res, fn) {
   if (convertInflight >= MAX_CONVERT_INFLIGHT) {
     res.setHeader("Retry-After", "1");
-    return sendError(
-      res,
-      429,
-      "busy",
-      "Converter busy; retry shortly",
-      req.requestId
-    );
+    return sendError(res, 429, "busy", "Converter busy; retry shortly", req.requestId);
   }
   convertInflight++;
   try {
@@ -272,7 +276,6 @@ async function withConvertSingleFlight(req, res, fn) {
 /* ------------------------------------------------------------------ */
 
 app.post("/convert", async (req, res) => {
-  // Encourage quick socket turnover
   res.setHeader("Connection", "close");
 
   return withConvertSingleFlight(req, res, async () => {
@@ -313,12 +316,7 @@ app.post("/convert", async (req, res) => {
       const status = e?.statusCode || 500;
       const code = e?.code || "conversion_failed";
 
-      console.error(
-        JSON.stringify({
-          requestId: req.requestId,
-          err: String(e?.stack || e),
-        })
-      );
+      console.error(JSON.stringify({ requestId: req.requestId, err: String(e?.stack || e) }));
 
       return sendError(
         res,
@@ -367,6 +365,5 @@ const server = app.listen(port, "0.0.0.0", () =>
   console.log(`converter listening on :${port}`)
 );
 
-// Reduce lingering keep-alive sockets
 server.keepAliveTimeout = 5_000;
 server.headersTimeout = 10_000;
