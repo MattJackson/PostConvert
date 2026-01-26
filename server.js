@@ -71,9 +71,7 @@ function isAborted(req, res) {
 
 function sendError(res, status, code, message, requestId) {
   if (res.headersSent) {
-    try {
-      res.end();
-    } catch {}
+    try { res.end(); } catch {}
     return;
   }
   res.status(status).json({ error: code, message, requestId });
@@ -213,7 +211,6 @@ async function heicToJpeg(input, opts) {
 
   const { width, height, rgba } = await heifDisplayToRGBA(imgs[0]);
 
-  // IMPORTANT: feed Sharp raw pixel metadata so it doesn't treat the buffer as an encoded image
   return normalizeForVision(Buffer.from(rgba), {
     ...opts,
     raw: { width, height, channels: 4 },
@@ -231,13 +228,11 @@ async function pdfFirstPageToJpeg(input, opts) {
 
   try {
     await fs.writeFile(pdf, input);
-
     await execFilePromise(
       "pdftoppm",
       ["-jpeg", "-singlefile", "-r", String(opts.pdfDpi), pdf, `/tmp/${id}`],
       DEFAULT_REQ_TIMEOUT_PDF_MS
     );
-
     const buf = await fs.readFile(out);
     return normalizeForVision(buf, opts);
   } finally {
@@ -255,9 +250,10 @@ let convertInflight = 0;
 
 async function withConvertSingleFlight(req, res, fn) {
   if (convertInflight >= MAX_CONVERT_INFLIGHT) {
+    res.setHeader("Retry-After", "1");
     return sendError(
       res,
-      503,
+      429,
       "busy",
       "Converter busy; retry shortly",
       req.requestId
@@ -276,7 +272,7 @@ async function withConvertSingleFlight(req, res, fn) {
 /* ------------------------------------------------------------------ */
 
 app.post("/convert", async (req, res) => {
-  // Encourage quick socket turnover; Fly will still manage concurrency.
+  // Encourage quick socket turnover
   res.setHeader("Connection", "close");
 
   return withConvertSingleFlight(req, res, async () => {
@@ -361,9 +357,7 @@ function clampInt(v, min, max, fallback) {
 }
 
 async function safeUnlink(p) {
-  try {
-    await fs.unlink(p);
-  } catch {}
+  try { await fs.unlink(p); } catch {}
 }
 
 /* ------------------------------------------------------------------ */
